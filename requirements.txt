@@ -1,0 +1,292 @@
+"""
+End-to-end pipeline tests: generate -> analyze -> recommend -> remediate,
+run against an isolated in-memory DB (see conftest.py).
+"""
+import re
+
+import pytest
+
+from app.analyzer import run_analysis
+from app.models import (
+    ActionStatus,
+    CloudResource,
+    Recommendation,
+    RecommendationStatus,
+    RemediationAction,
+    ResourceType,
+)
+from app.remediation import RemediationError, dismiss_recommendation, execute_remediation
+from app.simulator import generate_synthetic_environment
+
+FLEET_KWARGS = dict(
+    num_instances=20, num_volumes=15, num_snapshots=15,
+    num_eips=10, num_load_balancers=8, num_rds=10,
+)
+
+
+def test_generate_creates_expected_resource_and_cost_record_counts(db_session):
+    result = generate_synthetic_environment(db_session, seed=7, **FLEET_KWARGS)
+    expected_total = sum(FLEET_KWARGS.values())
+
+    assert result["resources_created"] == expected_total
+    assert db_session.query(CloudResource).count() == expected_total
+    # 30 days of history per resource
+    from app.models import CostRecord
+    assert db_session.query(CostRecord).count() == expected_total * 30
+
+
+def test_full_pipeline_generate_analyze_remediate(db_session):
+    generate_synthetic_environment(db_session, seed=7, **FLEET_KWARGS)
+
+    analysis = run_analysis(db_session)
+    assert analysis["resources_scanned"] == sum(FLEET_KWARGS.values())
+    assert analysis["recommendations_created"] > 0
+
+    open_recs = (
+        db_session.query(Recommendation)
+        .filter(Recommendation.status == RecommendationStatus.OPEN)
+        .all()
+    )
+    assert len(open_recs) == analysis["recommendations_created"]
+
+    rec = open_recs[0]
+    resource = db_session.get(CloudResource, rec.resource_db_id)
+    cost_before = resource.monthly_cost
+    promised_savings = rec.estimated_monthly_savings
+
+    action = execute_remediation(db_session, rec.id)
+
+    assert action.status == ActionStatus.COMPLETED
+    assert action.savings_realized_monthly == pytest.approx(promised_savings, abs=0.02)
+
+    db_session.refresh(rec)
+    db_session.refresh(resource)
+    assert rec.status == RecommendationStatus.REMEDIATED
+    assert resource.monthly_cost < cost_before
+    assert resource.monthly_cost == pytest.approx(cost_before - action.savings_realized_monthly, abs=0.01)
+
+
+def test_realized_savings_accumulates_across_remediations(db_session):
+    generate_synthetic_environment(db_session, seed=7, **FLEET_KWARGS)
+    run_analysis(db_session)
+
+    open_recs = (
+        db_session.query(Recommendation)
+        .filter(Recommendation.status == RecommendationStatus.OPEN)
+        .limit(3)
+        .all()
+    )
+    assert len(open_recs) == 3
+
+    total_realized_before = (
+        db_session.query(RemediationAction).count()
+    )
+    assert total_realized_before == 0
+
+    running_total = 0.0
+    for rec in open_recs:
+        action = execute_remediation(db_session, rec.id)
+        running_total += action.savings_realized_monthly
+
+        actual_total = sum(
+            a.savings_realized_monthly
+            for a in db_session.query(RemediationAction).filter(RemediationAction.status == ActionStatus.COMPLETED)
+        )
+        assert actual_total == pytest.approx(running_total, abs=0.01)
+
+    assert db_session.query(RemediationAction).count() == 3
+
+
+def test_regenerating_fleet_does_not_orphan_recommendations(db_session):
+    """Regression guard: generate_synthetic_environment used to bulk-delete
+    CloudResource/CostRecord without also wiping Recommendation/
+    RemediationAction, and SQLAlchemy's delete-orphan cascade doesn't fire on
+    bulk Query.delete() -- so regenerating left stale recommendation rows
+    pointing at resource_db_ids that no longer existed."""
+    generate_synthetic_environment(db_session, seed=7, **FLEET_KWARGS)
+    analysis_1 = run_analysis(db_session)
+    assert analysis_1["recommendations_created"] > 0
+
+    # Regenerate again (a different seed, so it's a genuinely fresh fleet)
+    generate_synthetic_environment(db_session, seed=9, **FLEET_KWARGS)
+    analysis_2 = run_analysis(db_session)
+    assert analysis_2["recommendations_created"] > 0
+
+    all_recs = db_session.query(Recommendation).all()
+    assert len(all_recs) == analysis_2["recommendations_created"], (
+        "stale recommendations from the first fleet survived regeneration"
+    )
+
+    live_resource_ids = {r.id for r in db_session.query(CloudResource).all()}
+    for rec in all_recs:
+        assert rec.resource_db_id in live_resource_ids, (
+            f"recommendation {rec.id} points at a resource_db_id that no longer exists"
+        )
+
+    assert db_session.query(RemediationAction).count() == 0
+
+
+def test_no_duplicate_recommendations_on_rerun(db_session):
+    generate_synthetic_environment(db_session, seed=7, **FLEET_KWARGS)
+
+    first = run_analysis(db_session)
+    assert first["recommendations_created"] > 0
+    count_after_first = db_session.query(Recommendation).count()
+
+    second = run_analysis(db_session)
+    assert second["recommendations_created"] == 0
+    assert db_session.query(Recommendation).count() == count_after_first
+
+
+def test_no_duplicate_recommendation_after_remediation_and_rerun(db_session):
+    """A remediated (resource, rule) pair must not get re-flagged just
+    because analysis runs again -- the recommendation should stay REMEDIATED,
+    not spawn a fresh OPEN duplicate for the same resource."""
+    generate_synthetic_environment(db_session, seed=7, **FLEET_KWARGS)
+    run_analysis(db_session)
+
+    rec = (
+        db_session.query(Recommendation)
+        .filter(Recommendation.status == RecommendationStatus.OPEN)
+        .first()
+    )
+    resource_db_id, rule_code = rec.resource_db_id, rec.rule_code
+    execute_remediation(db_session, rec.id)
+
+    run_analysis(db_session)
+
+    matches = (
+        db_session.query(Recommendation)
+        .filter(
+            Recommendation.resource_db_id == resource_db_id,
+            Recommendation.rule_code == rule_code,
+        )
+        .all()
+    )
+    assert len(matches) == 1
+    assert matches[0].status == RecommendationStatus.REMEDIATED
+
+
+def test_remediating_twice_fails(db_session):
+    generate_synthetic_environment(db_session, seed=7, **FLEET_KWARGS)
+    run_analysis(db_session)
+    rec = (
+        db_session.query(Recommendation)
+        .filter(Recommendation.status == RecommendationStatus.OPEN)
+        .first()
+    )
+
+    execute_remediation(db_session, rec.id)
+
+    with pytest.raises(RemediationError):
+        execute_remediation(db_session, rec.id)
+
+
+def test_dismissed_recommendation_cannot_be_remediated(db_session):
+    generate_synthetic_environment(db_session, seed=7, **FLEET_KWARGS)
+    run_analysis(db_session)
+    rec = (
+        db_session.query(Recommendation)
+        .filter(Recommendation.status == RecommendationStatus.OPEN)
+        .first()
+    )
+
+    dismiss_recommendation(db_session, rec.id)
+
+    with pytest.raises(RemediationError):
+        execute_remediation(db_session, rec.id)
+
+
+# --- CLI command validity, exercised through the real generate->analyze pipeline ---
+
+RULE_TO_RESOURCE_TYPE = {
+    "IDLE_INSTANCE": ResourceType.EC2_INSTANCE,
+    "OVERSIZED_INSTANCE": ResourceType.EC2_INSTANCE,
+    "UNATTACHED_VOLUME": ResourceType.EBS_VOLUME,
+    "STALE_SNAPSHOT": ResourceType.SNAPSHOT,
+    "UNUSED_ELASTIC_IP": ResourceType.ELASTIC_IP,
+    "IDLE_LOAD_BALANCER": ResourceType.LOAD_BALANCER,
+    "IDLE_RDS_INSTANCE": ResourceType.RDS_INSTANCE,
+}
+
+ID_PATTERNS = {
+    ResourceType.EC2_INSTANCE: re.compile(r"^i-[0-9a-f]{17}$"),
+    ResourceType.EBS_VOLUME: re.compile(r"^vol-[0-9a-f]{17}$"),
+    ResourceType.SNAPSHOT: re.compile(r"^snap-[0-9a-f]{17}$"),
+    ResourceType.ELASTIC_IP: re.compile(r"^eipalloc-[0-9a-f]{17}$"),
+    ResourceType.LOAD_BALANCER: re.compile(
+        r"^arn:aws:elasticloadbalancing:[a-z0-9-]+:\d{12}:loadbalancer/app/[a-zA-Z0-9-]+/[0-9a-f]{16}$"
+    ),
+    ResourceType.RDS_INSTANCE: re.compile(r"^[a-zA-Z][a-zA-Z0-9]*(-[a-zA-Z0-9]+)*$"),
+}
+
+SERVICE_PREFIX = {
+    ResourceType.EC2_INSTANCE: "aws ec2",
+    ResourceType.EBS_VOLUME: "aws ec2",
+    ResourceType.SNAPSHOT: "aws ec2",
+    ResourceType.ELASTIC_IP: "aws ec2",
+    ResourceType.LOAD_BALANCER: "aws elbv2",
+    ResourceType.RDS_INSTANCE: "aws rds",
+}
+
+# Sized (with this fixed seed) to guarantee at least one recommendation of
+# every rule type fires, including the rarer OVERSIZED_INSTANCE -- verified
+# empirically before writing this test.
+COVERAGE_FLEET_KWARGS = dict(
+    num_instances=60, num_volumes=40, num_snapshots=30,
+    num_eips=25, num_load_balancers=20, num_rds=25,
+)
+COVERAGE_SEED = 1
+
+
+def test_every_recommendation_type_has_a_valid_aws_cli_command(db_session):
+    """Integration-level regression guard for the bugs found and fixed this
+    session: runs the *real* generate+analyze pipeline (not hand-built
+    fixtures) and checks every recommendation's stored cli_command against
+    the correct AWS service and the correct real-world id/ARN format for its
+    resource type. This is what would have caught RDS emitting an `aws ec2`
+    command, and load balancers/RDS using non-AWS synthetic ids."""
+    generate_synthetic_environment(db_session, seed=COVERAGE_SEED, **COVERAGE_FLEET_KWARGS)
+    run_analysis(db_session)
+
+    recs = db_session.query(Recommendation).all()
+    assert recs, "expected at least one recommendation"
+
+    seen_rules = set()
+    for rec in recs:
+        resource = db_session.get(CloudResource, rec.resource_db_id)
+        expected_type = RULE_TO_RESOURCE_TYPE[rec.rule_code]
+        seen_rules.add(rec.rule_code)
+
+        assert resource.resource_type == expected_type
+        assert rec.cli_command, f"{rec.rule_code} recommendation has no cli_command"
+        assert rec.cli_command.startswith(SERVICE_PREFIX[expected_type]), (
+            f"{rec.rule_code}: expected service {SERVICE_PREFIX[expected_type]!r}, "
+            f"got command: {rec.cli_command!r}"
+        )
+        assert ID_PATTERNS[expected_type].match(resource.resource_id), (
+            f"{expected_type} resource_id {resource.resource_id!r} isn't a valid AWS id/ARN format"
+        )
+        assert resource.resource_id in rec.cli_command
+
+        if expected_type == ResourceType.RDS_INSTANCE:
+            assert "ec2" not in rec.cli_command  # the bug this whole test exists to catch
+
+    assert seen_rules == set(RULE_TO_RESOURCE_TYPE.keys()), (
+        f"missing rule types in this run: {set(RULE_TO_RESOURCE_TYPE.keys()) - seen_rules}"
+    )
+
+
+def test_remediation_action_records_the_same_cli_command_it_executed(db_session):
+    generate_synthetic_environment(db_session, seed=7, **FLEET_KWARGS)
+    run_analysis(db_session)
+    rec = (
+        db_session.query(Recommendation)
+        .filter(Recommendation.status == RecommendationStatus.OPEN)
+        .first()
+    )
+    preview_command = rec.cli_command
+
+    action = execute_remediation(db_session, rec.id)
+
+    assert action.cli_command == preview_command
