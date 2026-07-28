@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" width="100%">
+</p>
+
 # Cloud Cost Optimizer
 
 A production-style cloud cost optimization platform built with Python, FastAPI, Streamlit, and SQLite. This project analyzes cloud resources, identifies cost-saving opportunities, estimates monthly savings, and generates AWS CLI remediation commands for infrastructure optimization.
